@@ -1,0 +1,22 @@
+# AUR Git checkout lives inside the workspace but is a separate repository.
+/aur/
+
+# makepkg output
+/pkg/
+/srcdir/
+*.pkg.tar.*
+*.log
+
+# Python/cache artifacts
+__pycache__/
+*.py[cod]
+
+# Editor/temp files
+*~
+*.swp
+.DS_Store
+
+# Local maintainer / AUR packaging workspace
+/WORKSPACE.md
+/packaging/
+/tools/
