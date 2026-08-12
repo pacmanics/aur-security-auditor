@@ -7,6 +7,7 @@ No package file is modified. Network access is controlled by explicit dashboard 
 from __future__ import annotations
 
 import argparse
+import ast
 import concurrent.futures
 import datetime as dt
 import hashlib
@@ -29,7 +30,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
-VERSION = "1.4.7"
+VERSION = "1.4.8"
 MAX_TEXT_BYTES = 8 * 1024 * 1024
 MAX_STRINGS_BYTES = 128 * 1024 * 1024
 
@@ -46,7 +47,21 @@ RULES = [
         r"(?:\||&&|;)\s*(?:ba|z|fi|da)?sh\b", re.I),
      "Decodes and executes an embedded payload"),
     ("high", "npm-bun-install-hook", re.compile(
-        r"\b(?:npm|npx|bun|bunx|pnpm|yarn)\b[^\n]{0,250}\b(?:install|add|exec|run|postinstall|preinstall)\b", re.I),
+        r"(?:"
+        r"(?<![A-Za-z0-9_./$-])(?:npm|npx|bun|bunx|pnpm|yarn)\s+"
+        r"(?:--?[A-Za-z0-9_-]+(?:=[^\s]+)?\s+){0,4}"
+        r"(?:ci|install|add|exec|run|postinstall|preinstall)\b"
+        r"|"
+        r"\b(?:exec(?:file)?(?:sync)?|spawn(?:sync)?|execa(?:sync)?)\s*\(\s*"
+        r"['\"](?:npm|npx|bun|bunx|pnpm|yarn)['\"][^\n]{0,250}\b"
+        r"(?:ci|install|add|exec|run|postinstall|preinstall)\b"
+        r"|"
+        r"\bBun\.spawn\s*\([^\n]{0,250}['\"](?:npm|npx|bun|bunx|pnpm|yarn)['\"]"
+        r"[^\n]{0,250}\b(?:ci|install|add|exec|run|postinstall|preinstall)\b"
+        r"|"
+        r"\bDeno\.Command\s*\(\s*['\"](?:npm|npx|bun|bunx|pnpm|yarn)['\"]"
+        r"[^\n]{0,250}\b(?:ci|install|add|exec|run|postinstall|preinstall)\b"
+        r")", re.I),
      "Package-manager execution during build/install"),
     ("high", "credential-targeting", re.compile(
         r"(?:\.ssh/(?:id_|authorized_keys|known_hosts)|credentials|wallet\.dat|"
@@ -583,11 +598,170 @@ def snippets(text: str, match: re.Match[str], radius: int = 140) -> tuple[int, s
     evidence = re.sub(r"\s+", " ", evidence).strip()
     return line, evidence[:500]
 
+SELF_AUDIT_LITERAL_RULES = {
+    "atomic-arch-c2", "atomic-arch-dependency", "atomic-arch-ioc",
+    "shell-download-exec", "encoded-payload-exec", "npm-bun-install-hook",
+    "credential-targeting", "persistence-systemd", "persistence-loader",
+    "kernel-ebpf", "suid-capability", "security-disable", "direct-ip-url",
+    "process-hiding", "shell-eval", "suspicious-temp-exec",
+}
+
+def _self_audit_scope(package: str, path: str) -> tuple[bool, bool]:
+    if package != "aur-security-auditor":
+        return False, False
+    normalized = path.replace("\\", "/").replace(" [strings]", "").lower()
+    own_code = (
+        normalized in {"/usr/bin/aur-security-auditor", "/usr/lib/aur-security-auditor/core.py"}
+        or normalized.endswith("/src/aur-security-auditor")
+        or normalized.endswith("/src/core.py")
+    )
+    own_data = (
+        normalized in {
+            "/usr/share/aur-security-auditor/iocs.json",
+            "/usr/share/aur-security-auditor/atomic-arch-packages.txt",
+        }
+        or ("/data/" in normalized and normalized.endswith(("iocs.json", "atomic-arch-packages.txt")))
+    )
+    return own_code, own_data
+
+def _ast_position_contains(text: str, pos: int, span: tuple[int, int, int, int]) -> bool:
+    line = text.count("\n", 0, pos) + 1
+    line_start = text.rfind("\n", 0, pos) + 1
+    column = len(text[line_start:pos].encode("utf-8"))
+    start_line, start_col, end_line, end_col = span
+    if line < start_line or line > end_line:
+        return False
+    if line == start_line and column < start_col:
+        return False
+    if line == end_line and column >= end_col:
+        return False
+    return True
+
+def _self_audit_literal_spans(text: str) -> list[tuple[int, int, int, int]]:
+    # Return only AST string spans that are demonstrably inert scanner data.
+    # Do not blanket-ignore string literals: strings used by real execution or
+    # network calls remain fully scannable.
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return []
+
+    spans: set[tuple[int, int, int, int]] = set()
+    protected_names = {"KNOWN_C2", "KNOWN_HASHES", "MALICIOUS_DEPS", "BPF_MAPS", "RULES"}
+    self_test_fixture_names = {"cases", "fixtures", "samples", "vectors", "test_cases"}
+    regex_methods = {
+        "compile", "search", "match", "fullmatch", "findall", "finditer",
+        "split", "sub", "subn",
+    }
+
+    def add_strings(node: ast.AST) -> None:
+        for child in ast.walk(node):
+            if (
+                isinstance(child, ast.Constant)
+                and isinstance(child.value, str)
+                and hasattr(child, "end_lineno")
+                and child.end_lineno is not None
+                and child.end_col_offset is not None
+            ):
+                spans.add((child.lineno, child.col_offset, child.end_lineno, child.end_col_offset))
+
+    def target_is_protected(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in protected_names
+        if isinstance(node, ast.Attribute):
+            return node.attr == "RULES"
+        if isinstance(node, ast.Subscript):
+            return target_is_protected(node.value)
+        if isinstance(node, (ast.Tuple, ast.List)):
+            return any(target_is_protected(item) for item in node.elts)
+        return False
+
+    def target_is_self_test_fixture(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in self_test_fixture_names
+        if isinstance(node, (ast.Tuple, ast.List)):
+            return any(target_is_self_test_fixture(item) for item in node.elts)
+        return False
+
+    def is_re_pattern_call(func: ast.AST) -> bool:
+        return (
+            isinstance(func, ast.Attribute)
+            and func.attr in regex_methods
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "re"
+        )
+
+    class Visitor(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.in_self_test = 0
+
+        def visit_Assign(self, node: ast.Assign) -> None:
+            if any(target_is_protected(target) for target in node.targets):
+                add_strings(node.value)
+            if self.in_self_test and any(target_is_self_test_fixture(target) for target in node.targets):
+                add_strings(node.value)
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+            if node.value is not None:
+                if target_is_protected(node.target):
+                    add_strings(node.value)
+                if self.in_self_test and target_is_self_test_fixture(node.target):
+                    add_strings(node.value)
+            self.generic_visit(node)
+
+        def visit_Call(self, node: ast.Call) -> None:
+            func = node.func
+
+            # Regex patterns are scanner definitions, not behavior. Only the
+            # pattern argument is protected; replacement/data arguments are not.
+            if is_re_pattern_call(func) and node.args:
+                add_strings(node.args[0])
+
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr in {"insert", "append", "extend"}
+                and target_is_protected(func.value)
+            ):
+                for arg in node.args:
+                    add_strings(arg)
+
+            # Narrow self-test helper exemption. subprocess/os.system/requests
+            # are intentionally not protected.
+            if self.in_self_test:
+                helper = ""
+                if isinstance(func, ast.Name):
+                    helper = func.id
+                elif isinstance(func, ast.Attribute):
+                    helper = func.attr
+                if helper in {"classify", "scan_text"}:
+                    for arg in node.args:
+                        add_strings(arg)
+
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if node.name == "self_test":
+                self.in_self_test += 1
+                self.generic_visit(node)
+                self.in_self_test -= 1
+                return
+            self.generic_visit(node)
+
+    Visitor().visit(tree)
+    return sorted(spans)
+
+
 def scan_text(package: str, path: str, text: str, digest: str = "") -> list[Finding]:
     findings: list[Finding] = []
     seen = set()
+    own_code, own_data = _self_audit_scope(package, path)
+    self_spans = _self_audit_literal_spans(text) if own_code else []
     for severity, rule, regex, message in RULES:
         for match in regex.finditer(text):
+            if package == "aur-security-auditor" and rule in SELF_AUDIT_LITERAL_RULES:
+                if own_data or any(_ast_position_contains(text, match.start(), span) for span in self_spans):
+                    continue
             line, evidence = snippets(text, match)
             key = (rule, line, evidence[:100])
             if key in seen:
@@ -608,6 +782,7 @@ def scan_text(package: str, path: str, text: str, digest: str = "") -> list[Find
             findings.append(Finding("high", "suspicious-host", package, path,
                                     f"Suspicious external host: {host}", url[:500], 0, digest))
     return findings
+
 
 SECURITY_SURFACE_PATTERNS = (
     ("sudoers", "critical", re.compile(r"^/etc/sudoers(?:\.d/|$)")),
@@ -930,30 +1105,52 @@ def scan_one(pkg: tuple[str, str], files: list[str], args, cache_roots: list[Pat
     return result
 
 def live_connections(foreign_names: set[str]) -> list[Finding]:
+    # Collect runtime socket context for installed foreign/AUR packages.
+    # ss -H -tupn columns:
+    # Netid State Recv-Q Send-Q Local-Address:Port Peer-Address:Port Process
     findings = []
     if os.geteuid() != 0:
         return findings
     cp = run(["ss", "-H", "-tupn"], timeout=30)
     if cp.returncode != 0:
         return findings
-    pid_re = re.compile(r'pid=(\d+)')
+
+    pid_re = re.compile(r"pid=(\d+)")
+
     for line in cp.stdout.splitlines():
-        remote = ""
         parts = line.split()
-        if len(parts) >= 5:
-            remote = parts[4]
-        for pid in pid_re.findall(line):
+        if len(parts) < 6:
+            continue
+
+        remote = parts[5]
+        seen_row_owners: set[tuple[str, str]] = set()
+
+        for pid in dict.fromkeys(pid_re.findall(line)):
             exe = Path("/proc") / pid / "exe"
             try:
                 target = os.readlink(exe)
             except OSError:
                 continue
+
             owner = owner_of(target)
-            if owner in foreign_names:
-                findings.append(Finding("medium", "live-outbound-connection", owner, target,
-                                        f"Running process has a network socket to {remote}",
-                                        line[:500]))
+            if owner not in foreign_names:
+                continue
+
+            key = (owner, target)
+            if key in seen_row_owners:
+                continue
+            seen_row_owners.add(key)
+
+            findings.append(Finding(
+                "medium",
+                "live-outbound-connection",
+                owner,
+                target,
+                f"Running process has a network socket to {remote}",
+                line[:500],
+            ))
     return findings
+
 
 def score_result(result: PackageResult) -> int:
     return sum(SEVERITY_POINTS[f.severity] for f in result.findings)

@@ -109,8 +109,8 @@ ghostwriter_raw = [
     ),
 ]
 ghostwriter = normalize("pentest-ghostwriter", ghostwriter_raw)
-assert ghostwriter["verdict"] == "review", ghostwriter
-assert rules(ghostwriter) == {"integrity-change"}, ghostwriter["findings"]
+assert ghostwriter["verdict"] == "clean", ghostwriter
+assert rules(ghostwriter) == {"metadata-permission-drift"}, ghostwriter["findings"]
 assert ghostwriter["context_summary"]["by_context"].get("foreign-binary") == 2
 assert ghostwriter["context_summary"]["by_context"].get("ci") == 2
 
@@ -148,7 +148,7 @@ mullvad_raw = [
     ),
 ]
 mullvad = normalize("mullvad-vpn-daemon-bin", mullvad_raw)
-assert mullvad["verdict"] == "review", mullvad
+assert mullvad["verdict"] == "clean", mullvad
 assert rules(mullvad) == {"expected-privileged-surface", "expected-permission-change"}, mullvad["findings"]
 assert all(item["severity"] == "low" for item in mullvad["findings"]), mullvad["findings"]
 

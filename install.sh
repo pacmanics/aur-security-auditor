@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.4.7"
+VERSION="1.4.8"
 ROOT_PREFIX="${AUR_SECURITY_AUDITOR_ROOT:-${AUR_MALWARE_SCANNER_ROOT:-${AUR_SCANNER_ROOT:-}}}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 

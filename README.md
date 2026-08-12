@@ -1,4 +1,4 @@
-# AUR Security Auditor 1.4.7
+# AUR Security Auditor 1.4.8
 
 Explainable security analysis for Arch Linux AUR and other foreign packages before installation, after installation and when package sources change.
 
@@ -8,9 +8,9 @@ The application opens a browser dashboard, remains idle until the user starts an
 
 ```bash
 cd ~/Downloads
-sha256sum -c aur-security-auditor-1.4.7.sha256
-tar -xzf aur-security-auditor-1.4.7.tar.gz
-cd aur-security-auditor-1.4.7
+sha256sum -c aur-security-auditor-1.4.8.sha256
+tar -xzf aur-security-auditor-1.4.8.tar.gz
+cd aur-security-auditor-1.4.8
 sudo ./install.sh
 ```
 
@@ -22,27 +22,24 @@ sudo aur-security-auditor
 
 The application-menu entry runs `/usr/bin/aur-security-auditor-launcher`. It displays a short English security banner explaining why root privileges are requested and then invokes `/usr/bin/aur-security-auditor` through sudo. Terminal and CLI operation remain English regardless of the system locale. German is selected only inside the browser dashboard. Animation is disabled automatically when no interactive terminal is attached.
 
-## What changed in 1.4.7
+## What changed in 1.4.8
 
-Version 1.4.7 adds context-aware verdicts and a fully interactive dependency viewer:
+Version 1.4.8 hardens context-aware verdicts and reduces false positives without weakening confirmed malware detection:
 
-- maintainer identity is now `pacmanics`, with `© PacmanicS` used for visible copyright branding
-- Help & About links to all AUR packages maintained by `pacmanics`
-- desktop startup now explains the privileged security boundary before requesting sudo authentication
-- malformed placeholder source URLs are filtered from new and saved reports
-- cancelling a running full scan now sends a valid JSON request
+- LOW-only advisory findings now keep the package verdict CLEAN, while MEDIUM, HIGH and CRITICAL evidence still escalate to REVIEW, SUSPICIOUS and THREAT
+- behavioral correlations require local executable context instead of unrelated signals elsewhere in the same large file
+- documentation, tests, CI files, wordlists, package metadata and foreign-platform binary strings stay non-actionable unless stronger evidence exists
+- JavaScript package-manager help/error text is separated from actual child-process, spawn, execa, Bun or Deno execution
+- exact malware hashes, confirmed malicious package/dependency names and executable confirmed C2 context remain hard indicators
+- the auditor can safely scan its own signature databases, regex definitions and self-test vectors without self-incrimination, while adjacent real payload logic remains detectable
+- insecure HTTP source severity is bound to the checksum of each concrete source instead of borrowing verification strength from another source
+- HTTP sources with an aligned strong checksum and no SKIP remain visible as LOW advisories; weak, missing or skipped verification remains REVIEW-worthy
+- Pacman metadata-only drift is distinguished from content tampering, with sensitive executable and privileged paths remaining REVIEW-worthy
+- expected browser sandbox SUID helpers require structural package/path context; a chrome-sandbox filename alone never bypasses review
+- runtime network context now reports the actual peer endpoint from ss and collapses duplicate PID records for the same socket
+- regression coverage includes the real false-positive patterns, a 42-scenario generic behavior/context/provenance corpus and dedicated runtime-network tests
 
-- documentation, installed metadata, wordlists, CI workflows, tests, fixtures, static assets and foreign-platform binaries no longer affect package verdicts through text matches alone
-- dangerous behavior is correlated only inside the same actionable build, install, service, executable or native-binary context
-- exact malware hashes, confirmed campaign package names and confirmed C2 evidence remain hard indicators
-- generic network and process-hiding patterns were tightened to avoid matches from minified assets, common runtime symbols and ordinary library code
-- package-managed SUID/SGID changes are explained as expected privileged surfaces when the package install script applies the same mode to the same file
-- matching Pacman permission differences are downgraded when no content, checksum or missing-file difference exists
-- raw signals remain in JSON exports together with a context summary, while filtered non-executable matches are excluded from the verdict
-- the dependency graph now loads all returned nodes into one fit-to-view canvas with mouse dragging, wheel zoom, zoom controls and a reset/fit action
-- package details use a wider, clearer layout and distinguish dependencies, reverse dependencies and the selected package visually
-
-The regression suite includes the real false-positive patterns observed in `dirsearch`, `yt-dlg`, `pentest-ghostwriter` and `mullvad-vpn-daemon-bin`. A real download-to-shell chain in a PKGBUILD continues to produce a suspicious verdict.
+The scanner remains evidence-weighted rather than whitelist-driven: benign wording is filtered by context, while real download/execute, encoded execution, credential exfiltration, persistence, privilege and confirmed IOC chains continue to escalate.
 
 ## Analysis modes
 

@@ -11,9 +11,11 @@ from pathlib import Path
 import re
 for rel in ['src/aur-security-auditor', 'src/core.py']:
     text = Path(rel).read_text()
-    assert 'VERSION = "1.4.7"' in text, rel
+    assert 'VERSION = "1.4.8"' in text, rel
 launcher = Path('src/aur-security-auditor-launcher').read_text()
-assert 'VERSION=1.4.7' in launcher
+assert 'VERSION=1.4.8' in launcher
+installer = Path('install.sh').read_text()
+assert 'VERSION="1.4.8"' in installer
 html = Path('data/dashboard.html').read_text()
 for token in [
     '__TOKEN__', '__NONCE__', 'const TOKEN="__TOKEN__"', '/api/scan/start',
@@ -98,6 +100,7 @@ python tests/update-guard.py
 python tests/i18n-audit.py
 python tests/release-polish-144.py
 python tests/context-awareness-145.py
+python tests/false-positive-regression-148.py
 python tests/startup-launcher-147.py
 python tests/hardening.py
 python tests/http-hardening.py
@@ -120,8 +123,8 @@ printf report > "$tmp/home/.local/state/aur-scanner/reports/legacy-report.json"
 printf legacy-malware > "$tmp/home/.config/aur-malware-scanner/update-guard.json"
 printf legacy-malware-report > "$tmp/home/.local/state/aur-malware-scanner/reports/malware-era-report.json"
 printf old > "$tmp/downloads/aur-scanner-dashboard-0.0.1.tar.gz"
-printf current > "$tmp/downloads/aur-security-auditor-1.4.7.tar.gz"
-printf current > "$tmp/downloads/aur-security-auditor-1.4.7.sha256"
+printf current > "$tmp/downloads/aur-security-auditor-1.4.8.tar.gz"
+printf current > "$tmp/downloads/aur-security-auditor-1.4.8.sha256"
 AUR_SECURITY_AUDITOR_ROOT="$tmp/root" \
 AUR_SECURITY_AUDITOR_DOWNLOAD_DIR="$tmp/downloads" \
 AUR_SECURITY_AUDITOR_TEST_CLEAN_DOWNLOADS=1 \
@@ -138,8 +141,8 @@ HOME="$tmp/home" USER=root \
 [[ ! -e "$tmp/root/usr/local/lib/aur-scanner" ]]
 [[ ! -e "$tmp/downloads/aur-scanner-dashboard-0.0.1.tar.gz" ]]
 [[ ! -e "$tmp/downloads/aur-scanner-0.0.1" ]]
-[[ -e "$tmp/downloads/aur-security-auditor-1.4.7.tar.gz" ]]
-[[ -e "$tmp/downloads/aur-security-auditor-1.4.7.sha256" ]]
+[[ -e "$tmp/downloads/aur-security-auditor-1.4.8.tar.gz" ]]
+[[ -e "$tmp/downloads/aur-security-auditor-1.4.8.sha256" ]]
 [[ -f "$tmp/home/.config/aur-security-auditor/suppressions.json" ]]
 [[ -f "$tmp/home/.local/state/aur-security-auditor/reports/legacy-report.json" ]]
 [[ -f "$tmp/home/.config/aur-security-auditor/update-guard.json" ]]
@@ -151,7 +154,7 @@ HOME="$tmp/home" USER=root \
 [[ "$(stat -c %a "$tmp/home/.local/state/aur-security-auditor/reports/legacy-report.json")" == "600" ]]
 [[ ! -e "$tmp/home/.config/aur-scanner" ]]
 [[ ! -e "$tmp/home/.config/aur-malware-scanner" ]]
-grep -q 'VERSION = "1.4.7"' "$tmp/root/usr/bin/aur-security-auditor"
+grep -q 'VERSION = "1.4.8"' "$tmp/root/usr/bin/aur-security-auditor"
 
 # The privileged installer must not follow user-controlled scanner data symlinks.
 mkdir -p "$tmp/symlink-home/.config" "$tmp/symlink-target" "$tmp/symlink-root"
@@ -166,5 +169,7 @@ if AUR_SECURITY_AUDITOR_ROOT="$tmp/symlink-root" \
 fi
 [[ "$(stat -c %a "$tmp/symlink-target")" == "755" ]]
 
+python3 tests/runtime-network-context-148.py
+python3 tests/generic-rule-corpus-148.py
 python tests/integration-dashboard.py
 echo 'Static, installer and integration tests: OK'

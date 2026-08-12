@@ -232,7 +232,7 @@ esac
             assert any(item["fingerprint"] == fingerprint and not item["suppressed"] for item in reactivated["package"]["findings"]), reactivated
 
             report = request(url + "api/report.json", token)
-            assert report["version"] == "1.4.7", report["version"]
+            assert report["version"] == "1.4.8", report["version"]
             assert report["schema_version"] == 2, report
             assert "elf-hardening" in report["capabilities"], report["capabilities"]
             assert report["delta"]["baseline_available"] is False, report["delta"]

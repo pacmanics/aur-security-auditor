@@ -33,7 +33,7 @@ from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any, Optional
 
-VERSION = "1.4.7"
+VERSION = "1.4.8"
 PACKAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._+:-]{0,199}$")
 MALICIOUS_DEPS = {"atomic-lockfile", "js-digest", "lockfile-js", "nextfile-js"}
 KNOWN_HASHES = {
@@ -405,6 +405,109 @@ def _sanitize_report_source_provenance(report: dict[str, Any]) -> bool:
     return True
 
 
+def _srcinfo_source_verification(documents: dict[str, str]) -> list[dict]:
+    groups: dict[str, dict] = {}
+    checksum_re = re.compile(
+        r"^(md5|sha1|sha224|sha256|sha384|sha512|b2)sums(?P<suffix>_[a-z0-9_]+)?$",
+        re.I,
+    )
+    source_re = re.compile(r"^source(?P<suffix>_[a-z0-9_]+)?$", re.I)
+    for name, text in documents.items():
+        if Path(name).name != ".SRCINFO":
+            continue
+        for line in text.splitlines():
+            match = re.match(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.*?)\s*$", line)
+            if not match:
+                continue
+            key, value = match.group(1).lower(), match.group(2).strip()
+            source_match = source_re.fullmatch(key)
+            checksum_match = checksum_re.fullmatch(key)
+            if source_match:
+                suffix = (source_match.group("suffix") or "").lower()
+                groups.setdefault(suffix, {"sources": [], "checksums": {}})
+                groups[suffix]["sources"].append(value)
+            elif checksum_match:
+                suffix = (checksum_match.group("suffix") or "").lower()
+                algorithm = checksum_match.group(1).lower()
+                groups.setdefault(suffix, {"sources": [], "checksums": {}})
+                groups[suffix]["checksums"].setdefault(algorithm, []).append(value)
+
+    expected_lengths = {
+        "md5": 32, "sha1": 40, "sha224": 56, "sha256": 64,
+        "sha384": 96, "sha512": 128, "b2": 128,
+    }
+    strength_order = ["b2", "sha512", "sha384", "sha256", "sha224", "sha1", "md5"]
+    strong = {"sha256", "sha384", "sha512", "b2"}
+    records: list[dict] = []
+
+    for suffix, group in sorted(groups.items()):
+        sources = group["sources"]
+        checksums = group["checksums"]
+        for index, source_entry in enumerate(sources):
+            urls = [
+                url for url in core.URL_RE.findall(source_entry)
+                if _is_valid_declared_source_url(url)
+            ]
+            if not urls:
+                continue
+            candidates = []
+            for algorithm in strength_order:
+                values = checksums.get(algorithm, [])
+                if index >= len(values):
+                    continue
+                value = values[index].strip().strip("'\"")
+                skipped = value.upper() == "SKIP"
+                valid = bool(
+                    not skipped
+                    and re.fullmatch(r"[0-9A-Fa-f]+", value)
+                    and len(value) == expected_lengths[algorithm]
+                )
+                candidates.append((algorithm, value, skipped, valid))
+
+            best = next((item for item in candidates if item[3]), None)
+            if best is None:
+                best = next((item for item in candidates if item[2]), None)
+            algorithm = best[0] if best else ""
+            skipped = bool(best and best[2])
+            valid = bool(best and best[3])
+            for url in urls:
+                records.append({
+                    "source": url,
+                    "group": suffix or "generic",
+                    "index": index,
+                    "algorithm": algorithm,
+                    "strong": bool(valid and algorithm in strong),
+                    "skipped": skipped,
+                })
+    return records
+
+
+def _all_insecure_sources_strongly_verified(provenance: dict) -> bool:
+    """Require every repeated insecure source occurrence to be strongly verified."""
+    insecure = {str(value) for value in provenance.get("insecure_sources", []) if value}
+    if not insecure:
+        return False
+    records = provenance.get("source_verification", [])
+    if not isinstance(records, list) or not records:
+        return False
+
+    matching = [
+        item for item in records
+        if isinstance(item, dict) and str(item.get("source")) in insecure
+    ]
+    if not matching:
+        return False
+
+    covered = {str(item.get("source")) for item in matching}
+    if not insecure.issubset(covered):
+        return False
+
+    return all(
+        bool(item.get("strong")) and not bool(item.get("skipped"))
+        for item in matching
+    )
+
+
 def source_document_metadata(documents, snapshot_url="", snapshot_sha256=""):
     urls = set(_declared_source_urls(documents))
     checksum_algorithms = set()
@@ -453,6 +556,7 @@ def source_document_metadata(documents, snapshot_url="", snapshot_sha256=""):
         "source_hosts": sorted(set(hosts)),
         "checksum_algorithms": sorted(checksum_algorithms),
         "skip_count": skip_count,
+        "source_verification": _srcinfo_source_verification(documents),
         "install_files": sorted(install_files),
         "insecure_sources": insecure,
         "direct_ip_sources": direct_ip,
@@ -646,6 +750,123 @@ def new_finding(severity, rule, package, path, message, evidence, confidence, re
     return obj
 
 
+def _signal_context_for_path(raw_path: str) -> str:
+    original = str(raw_path or "").replace("\\", "/")
+    strings_view = original.lower().endswith(" [strings]")
+    path = original[:-10] if strings_view else original
+    lower = path.lower()
+
+    if lower.startswith("aur history:"):
+        return "build"
+    if lower.startswith("aur snapshot:"):
+        path = path[len("AUR snapshot:"):].lstrip()
+        lower = path.lower()
+
+    base = Path(lower).name
+    suffix = Path(base).suffix
+    parts = {part for part in lower.split("/") if part}
+
+    foreign_names = (
+        "-macos", "_macos", "-darwin", "_darwin", "macos-", "darwin-",
+        "-windows", "_windows", "windows-", "win32", "win64",
+    )
+    if base.endswith((".exe", ".dll", ".dylib", ".app")) or any(marker in base for marker in foreign_names):
+        return "foreign-binary"
+    if any(marker in lower for marker in ("/.github/workflows/", "/.gitlab/", "/.circleci/")) or base in {
+            ".gitlab-ci.yml", "azure-pipelines.yml", "jenkinsfile"}:
+        return "ci"
+    if any(marker in lower for marker in ("/.cache/yay/", "/.cache/paru/clone/", "/.cache/pikaur/build/")):
+        return "build"
+    if base in {"pkgbuild", ".srcinfo"}:
+        return "build"
+    if any(marker in parts for marker in {"tests", "testing", "fixture", "fixtures", "demo", "demos", "example", "examples", "sample", "samples"}):
+        return "test-data"
+    if any(marker in parts for marker in {"doc", "docs", "documentation"}) or base.startswith(("readme", "changelog", "changes", "authors", "contributing")) or suffix in {".md", ".mdx", ".rst", ".adoc"}:
+        return "documentation"
+    if base in {"metadata", "record", "entry_points.txt", "top_level.txt"} or ".dist-info/" in lower or ".egg-info/" in lower:
+        return "metadata"
+    if base in {"dockerfile", "containerfile", "makefile", "cmakelists.txt", "meson.build"}:
+        return "build-recipe"
+    if any(token in base for token in ("wordlist", "word-list", "dictionary", "dicc")) or any(marker in parts for marker in {"wordlists", "dictionaries"}):
+        return "wordlist"
+    if suffix in {".css", ".svg", ".woff", ".woff2", ".ttf", ".otf", ".map"} or "/static/vendor/" in lower or "/vendor/" in lower or base.endswith((".min.js", ".min.css")):
+        return "asset"
+    if base in {"package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb", "pyproject.toml", "cargo.lock", "go.sum"}:
+        return "manifest"
+    if base.endswith((".install", ".hook")) or "/var/lib/pacman/local/" in lower and base == "install":
+        return "install"
+    if base.endswith((".service", ".timer", ".socket", ".path")) or "/systemd/" in lower:
+        return "service"
+    if strings_view:
+        return "binary"
+    if base.endswith((".sh", ".bash", ".zsh", ".fish", ".py", ".pl", ".rb", ".js", ".mjs", ".cjs", ".desktop")):
+        return "executable"
+    if lower.startswith(("/usr/bin/", "/usr/sbin/", "/opt/")) and suffix not in {".txt", ".json", ".yaml", ".yml", ".conf", ".env"}:
+        return "executable"
+    if suffix in {".txt", ".csv", ".json", ".yaml", ".yml", ".toml", ".ini", ".conf", ".env"}:
+        return "data"
+    return "other"
+
+
+def _expected_browser_sandbox(path: str, probe_path: str | Path | None = None) -> bool:
+    normalized = str(path or "").replace(" [strings]", "").replace("\\", "/")
+    if not normalized.startswith(("/usr/lib/", "/opt/")):
+        return False
+    candidate = Path(probe_path) if probe_path is not None else Path(normalized)
+    if candidate.name not in {"chrome-sandbox", "msedge-sandbox"}:
+        return False
+    try:
+        if candidate.is_symlink() or not candidate.is_file():
+            return False
+        with candidate.open("rb") as handle:
+            if handle.read(4) != b"\x7fELF":
+                return False
+        if candidate.stat().st_mode & 0o022:
+            return False
+    except OSError:
+        return False
+
+    parent = candidate.parent
+    marker_names = {
+        "resources.pak", "icudtl.dat", "chrome_100_percent.pak",
+        "chrome_200_percent.pak", "snapshot_blob.bin", "v8_context_snapshot.bin",
+    }
+    markers = sum((parent / name).is_file() for name in marker_names)
+    resources = parent / "resources"
+    if (resources / "app.asar").is_file() or (resources / "electron.asar").is_file():
+        markers += 1
+    return markers >= 2
+
+
+def _integrity_metadata_paths(evidence: str) -> list[str]:
+    return [
+        match.group(1).strip()
+        for match in re.finditer(
+            r"warning:\s+[^\n]*?:\s+(/[^\n]*?)\s+\((?:permissions|uid|gid)\s+mismatch\)",
+            evidence or "", re.I,
+        )
+    ]
+
+
+def _sensitive_metadata_path(path: str) -> bool:
+    normalized = "/" + str(path or "").lstrip("/")
+    exact = {
+        "/etc/sudoers", "/etc/passwd", "/etc/shadow", "/etc/group", "/etc/gshadow",
+        "/etc/ld.so.preload",
+    }
+    if normalized in exact:
+        return True
+    prefixes = (
+        "/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/",
+        "/etc/sudoers.d/", "/etc/pam.d/", "/usr/lib/security/",
+        "/etc/systemd/", "/usr/lib/systemd/",
+        "/etc/polkit-1/", "/usr/share/polkit-1/",
+        "/etc/ssh/", "/etc/profile.d/", "/etc/cron.", "/etc/cron/",
+        "/usr/lib/modules/", "/boot/",
+    )
+    return normalized.startswith(prefixes)
+
+
 def normalize_result(result, exposure, suppressions):
     """Turn raw indicators into context-aware, explainable package verdicts.
 
@@ -666,54 +887,7 @@ def normalize_result(result, exposure, suppressions):
         return value.replace("\\", "/")
 
     def signal_context(item):
-        path = clean_path(item)
-        lower = path.lower()
-        base = Path(lower).name
-        suffix = Path(base).suffix
-        parts = {part for part in lower.split("/") if part}
-
-        foreign_names = (
-            "-macos", "_macos", "-darwin", "_darwin", "macos-", "darwin-",
-            "-windows", "_windows", "windows-", "win32", "win64",
-        )
-        if base.endswith((".exe", ".dll", ".dylib", ".app")) or any(marker in base for marker in foreign_names):
-            return "foreign-binary"
-        if any(marker in lower for marker in ("/.github/workflows/", "/.gitlab/", "/.circleci/")) or base in {
-                ".gitlab-ci.yml", "azure-pipelines.yml", "jenkinsfile"}:
-            return "ci"
-        if any(marker in lower for marker in ("/.cache/yay/", "/.cache/paru/clone/", "/.cache/pikaur/build/")):
-            return "build"
-        if lower.startswith(("aur snapshot:", "aur history:")):
-            return "build"
-        if base in {"pkgbuild", ".srcinfo"}:
-            return "build"
-        if any(marker in parts for marker in {"tests", "testing", "fixture", "fixtures", "demo", "demos", "example", "examples", "sample", "samples"}):
-            return "test-data"
-        if any(marker in parts for marker in {"doc", "docs", "documentation"}) or base.startswith(("readme", "changelog", "changes", "authors", "contributing")) or suffix in {".md", ".mdx", ".rst", ".adoc"}:
-            return "documentation"
-        if base in {"metadata", "record", "entry_points.txt", "top_level.txt"} or ".dist-info/" in lower or ".egg-info/" in lower:
-            return "metadata"
-        if base in {"dockerfile", "containerfile", "makefile", "cmakelists.txt", "meson.build"}:
-            return "build-recipe"
-        if any(token in base for token in ("wordlist", "word-list", "dictionary", "dicc")) or any(marker in parts for marker in {"wordlists", "dictionaries"}):
-            return "wordlist"
-        if suffix in {".css", ".svg", ".woff", ".woff2", ".ttf", ".otf", ".map"} or "/static/vendor/" in lower or "/vendor/" in lower or base.endswith((".min.js", ".min.css")):
-            return "asset"
-        if base in {"package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb", "pyproject.toml", "cargo.lock", "go.sum"}:
-            return "manifest"
-        if base.endswith((".install", ".hook")) or "/var/lib/pacman/local/" in lower and base == "install":
-            return "install"
-        if base.endswith((".service", ".timer", ".socket", ".path")) or "/systemd/" in lower:
-            return "service"
-        if str(item.path).lower().endswith(" [strings]"):
-            return "binary"
-        if base.endswith((".sh", ".bash", ".zsh", ".fish", ".py", ".pl", ".rb", ".js", ".mjs", ".cjs", ".desktop")):
-            return "executable"
-        if lower.startswith(("/usr/bin/", "/usr/sbin/", "/opt/")) and suffix not in {".txt", ".json", ".yaml", ".yml", ".conf", ".env"}:
-            return "executable"
-        if suffix in {".txt", ".csv", ".json", ".yaml", ".yml", ".toml", ".ini", ".conf", ".env"}:
-            return "data"
-        return "other"
+        return _signal_context_for_path(str(item.path or ""))
 
     behavioral_contexts = {"build", "install", "service", "executable", "binary"}
 
@@ -727,10 +901,18 @@ def normalize_result(result, exposure, suppressions):
                     return item
         return None
 
-    def same_path_items(rule_a, rule_b, predicate=None):
+    def same_path_items(rule_a, rule_b, predicate=None, max_line_distance=40):
         for left in by_rule.get(rule_a, []):
             for right in by_rule.get(rule_b, []):
                 if clean_path(left) != clean_path(right):
+                    continue
+                left_line = int(getattr(left, "line", 0) or 0)
+                right_line = int(getattr(right, "line", 0) or 0)
+                if (
+                    max_line_distance is not None
+                    and left_line > 0 and right_line > 0
+                    and abs(left_line - right_line) > max_line_distance
+                ):
                     continue
                 if predicate is None or predicate(left, right):
                     return left, right
@@ -780,8 +962,15 @@ def normalize_result(result, exposure, suppressions):
             ["Exakter veröffentlichter C2", "Ausführbarer oder Build-Kontext", "Netzwerkfähige Logik"], ["atomic-arch-c2"],
             lambda item: item is c2_exec)
     elif "atomic-arch-c2" in rules:
-        add("medium", "ioc-reference-review", "Bekannter C2-Indikator wird als Text oder Datenreferenz geführt", 68,
-            ["Exakter IOC-String", "Kein nachgewiesener Verbindungs- oder Ausführungskontext"], ["atomic-arch-c2"])
+        inert = {"documentation", "test-data", "ci", "metadata", "wordlist", "asset", "data"}
+        c2_reference = first(["atomic-arch-c2"], lambda item: signal_context(item) not in inert)
+        if c2_reference:
+            add("medium", "ioc-reference-review", "Bekannter C2-Indikator wird außerhalb eines klar inerten Referenzkontexts geführt", 68,
+                ["Exakter IOC-String", "Kein nachgewiesener Verbindungs- oder Ausführungskontext"], ["atomic-arch-c2"],
+                lambda item: item is c2_reference)
+        else:
+            add("low", "ioc-reference-note", "Bekannter C2-Indikator steht ausschließlich in Dokumentation, Tests oder anderen inerten Daten", 34,
+                ["Exakter IOC-String", "Inerter Referenzkontext", "Kein Ausführungs- oder Netzwerkbeweis"], ["atomic-arch-c2"])
 
     dep_rules = ["atomic-arch-dependency", "atomic-arch-ioc"]
     dep_src = first(dep_rules, lambda item: signal_context(item) in {"build", "install", "manifest"})
@@ -915,6 +1104,10 @@ def normalize_result(result, exposure, suppressions):
         add("low", "expected-privileged-surface", "Paketinstallationsskript setzt nachvollziehbar SUID/SGID auf eine paketverwaltete Datei", 55,
             ["Installierte privilegierte Datei", "Gleicher Dateiname im Installationsskript", "Sicherheitsoberfläche bleibt sichtbar, ist aber kein Malware-Beweis"],
             [installed_privileged.rule], lambda item: item is installed_privileged)
+    elif installed_privileged and _expected_browser_sandbox(clean_path(installed_privileged)):
+        add("low", "expected-sandbox-helper", "Paket installiert einen strukturell bestätigten Chromium-/Electron-Sandbox-Helper mit SUID", 50,
+            ["Bekannter Sandbox-Dateiname", "ELF-Datei in Chromium-/Electron-Laufzeitstruktur", "Mehrere benachbarte Runtime-Artefakte bestätigen den Kontext", "Bleibt als lokale Privilegienoberfläche sichtbar"],
+            [installed_privileged.rule], lambda item: item is installed_privileged)
     elif installed_privileged:
         add("medium", "privileged-installed-file", "Paket installiert eine SUID-/SGID-Datei ohne passende Erklärung im Installationsskript", 70,
             ["Erweiterte lokale Rechte", "Zweck und Herkunft sollten geprüft werden"],
@@ -983,14 +1176,30 @@ def normalize_result(result, exposure, suppressions):
 
     if "integrity-warning" in rules:
         integrity_src = first(["integrity-warning"])
-        expected_permission_only = bool(
-            integrity_src and explained_setter and
-            "permissions mismatch" in (integrity_src.evidence or "").lower() and
-            not re.search(r"(?:missing file|size mismatch|checksum mismatch|modification time mismatch)", integrity_src.evidence or "", re.I)
+        integrity_evidence = (integrity_src.evidence or "") if integrity_src else ""
+        content_mismatch = bool(re.search(
+            r"(?:missing file|size mismatch|checksum mismatch|modification time mismatch)",
+            integrity_evidence, re.I,
+        ))
+        permission_metadata_only = bool(
+            integrity_src
+            and re.search(r"(?:permissions|uid|gid)\s+mismatch", integrity_evidence, re.I)
+            and not content_mismatch
         )
+        metadata_paths = _integrity_metadata_paths(integrity_evidence)
+        sensitive_metadata = any(_sensitive_metadata_path(path) for path in metadata_paths)
+        expected_permission_only = bool(permission_metadata_only and explained_setter)
         if expected_permission_only:
             add("low", "expected-permission-change", "Pacman meldet eine durch das Installationsskript nachvollziehbare Berechtigungsänderung", 54,
                 ["Nur Berechtigungsabweichung", "Passende SUID/SGID-Anweisung im Paketinstallationsskript", "Kein Inhalts- oder Prüfsummenunterschied"],
+                ["integrity-warning"], lambda item: item is integrity_src)
+        elif permission_metadata_only and sensitive_metadata:
+            add("medium", "sensitive-metadata-drift", "Pacman meldet unerklärte UID-/GID-/Berechtigungsabweichungen an einer sicherheitsrelevanten Systemdatei", 72,
+                ["Nur Metadatenabweichung, aber sensitiver Pfad", "Executable-, Auth-, Loader-, Service- oder privilegierter Systemkontext", "Manuelle Prüfung der tatsächlichen Rechte/Eigentümer empfohlen"],
+                ["integrity-warning"], lambda item: item is integrity_src)
+        elif permission_metadata_only:
+            add("low", "metadata-permission-drift", "Pacman meldet ausschließlich UID-/GID-/Berechtigungsabweichungen ohne Inhaltsänderung", 46,
+                ["Nur Dateisystem-Metadaten weichen ab", "Kein fehlender Inhalt, Größen-, Prüfsummen- oder Zeitstempelunterschied", "Kein sensitiver Systempfad erkannt"],
                 ["integrity-warning"], lambda item: item is integrity_src)
         else:
             add("medium", "integrity-change", "Pacman meldet veränderte oder fehlende Paketdateien", 72,
@@ -1006,8 +1215,20 @@ def normalize_result(result, exposure, suppressions):
         add("low", "recent-source-host-change", "Ein aktueller AUR-Commit hat neue Quellhosts eingeführt", 48,
             ["Änderung der Supply-Chain-Herkunft", "Neue Hosts sind nicht automatisch bösartig"], ["aur-source-host-change"])
     if "aur-insecure-source" in rules:
-        add("medium", "insecure-aur-source", "AUR-Quellmetadaten verwenden unverschlüsseltes HTTP", 68,
-            ["Transport kann manipuliert werden", "Prüfsummen können das Risiko teilweise reduzieren"], ["aur-insecure-source"])
+        provenance = getattr(result, "source_provenance", {}) or {}
+        fully_pinned = _all_insecure_sources_strongly_verified(provenance)
+        add(
+            "low" if fully_pinned else "medium",
+            "insecure-aur-source",
+            "AUR-Quellmetadaten verwenden unverschlüsseltes HTTP",
+            50 if fully_pinned else 70,
+            (
+                ["Unverschlüsselter Transport bleibt sichtbar", "Jede konkrete HTTP-Quelle ist in .SRCINFO einer starken fest hinterlegten Prüfsumme zugeordnet"]
+                if fully_pinned else
+                ["Transport kann manipuliert werden", "Mindestens eine konkrete HTTP-Quelle ist nicht eindeutig stark und quellbezogen verifiziert"]
+            ),
+            ["aur-insecure-source"],
+        )
     if "aur-ephemeral-source" in rules:
         add("medium", "ephemeral-aur-source", "AUR-Quellmetadaten verwenden einen kurzlebigen oder anonymen Hostingdienst", 72,
             ["Schwer reproduzierbare Quelle", "Erhöhtes Supply-Chain-Risiko"], ["aur-ephemeral-source"])
@@ -1018,7 +1239,21 @@ def normalize_result(result, exposure, suppressions):
         add("low", "checksum-skipped", "PKGBUILD überspringt mindestens eine Quellprüfsumme", 45,
             ["Schwächere Supply-Chain-Absicherung", "Allein kein Malware-Beweis"], ["checksum-skipped"])
 
-    package_manager_src = first(["npm-bun-install-hook"], actionable)
+    def package_manager_actionable(item):
+        context = signal_context(item)
+        if context not in {"build", "install", "executable"}:
+            return False
+        path = clean_path(item).lower()
+        if path.endswith((".js", ".mjs", ".cjs")):
+            evidence = item.evidence or ""
+            return bool(re.search(
+                r"(?:child_process|exec(?:file)?(?:sync)?\s*\(|spawn(?:sync)?\s*\(|"
+                r"execa(?:sync)?\s*\(|shelljs|bun\.spawn|deno\.command)",
+                evidence, re.I,
+            ))
+        return True
+
+    package_manager_src = first(["npm-bun-install-hook"], package_manager_actionable)
     if package_manager_src and not dep_src:
         add("low", "runtime-package-manager", "Ausführbare Build-/Installationslogik startet einen JavaScript-Paketmanager", 40,
             ["Kann legitim sein", "Wird nur im tatsächlichen Build-, Installations- oder Programmkontext bewertet"],
@@ -1037,7 +1272,7 @@ def normalize_result(result, exposure, suppressions):
         verdict = "threat"
     elif any(item["severity"] == "high" for item in unsuppressed):
         verdict = "suspicious"
-    elif unsuppressed:
+    elif any(item["severity"] == "medium" for item in unsuppressed):
         verdict = "review"
     else:
         verdict = "clean"
@@ -1788,10 +2023,16 @@ def _preflight_normalize_raw(package: str, raw_findings: list) -> list[dict]:
         "install-script": ("low", 40, "Paket enthält automatisch ausgeführte Installations-Lifecycle-Hooks"),
     }
     allowed_context = {"PKGBUILD", ".SRCINFO"}
+    inert_contexts = {"documentation", "test-data", "ci", "metadata", "wordlist", "asset", "foreign-binary"}
     for finding in raw_findings:
         document = finding.path.removeprefix("AUR preflight:")
         base = Path(document).name
-        if finding.rule == "network-client":
+        context = _signal_context_for_path(document)
+        if context in inert_contexts:
+            continue
+        if finding.rule == "atomic-arch-c2" and context == "data":
+            severity, confidence, message = "low", 45, "Bekannter C2-Indikator steht nur in einer Daten-/Konfigurationsreferenz"
+        elif finding.rule == "network-client":
             # curl/wget in PKGBUILD or install files is relevant; plain source URLs are not matched by this rule.
             severity, confidence, message = "medium", 70, "Build- oder Installationscode startet einen Netzwerk-Client"
         elif finding.rule in mapping:
@@ -1931,11 +2172,16 @@ def preflight_analysis(target: str, include_history: bool = False) -> dict:
             ["Branch- oder ungebundene Git-Quellen können sich ohne PKGBUILD-Änderung verändern"],
         ))
     if provenance.get("insecure_sources"):
+        http_fully_pinned = _all_insecure_sources_strongly_verified(provenance)
         findings.append(_preflight_finding(
-            package, "medium", "preflight-http-source", ".SRCINFO",
+            package, "low" if http_fully_pinned else "medium", "preflight-http-source", ".SRCINFO",
             "Mindestens eine Quell-URL verwendet unverschlüsseltes HTTP",
-            "\n".join(provenance["insecure_sources"])[:800], 0, 74,
-            ["Transport kann manipuliert werden", "Starke Prüfsummen reduzieren, beseitigen das Risiko aber nicht vollständig"],
+            "\n".join(provenance["insecure_sources"])[:800], 0, 52 if http_fully_pinned else 76,
+            (
+                ["Unverschlüsselter Transport bleibt sichtbar", "Jede konkrete HTTP-Quelle ist in .SRCINFO einer starken fest hinterlegten Prüfsumme zugeordnet"]
+                if http_fully_pinned else
+                ["Transport kann manipuliert werden", "Mindestens eine konkrete HTTP-Quelle ist nicht eindeutig stark und quellbezogen verifiziert"]
+            ),
         ))
     if provenance.get("ephemeral_hosts"):
         findings.append(_preflight_finding(

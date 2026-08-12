@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.4.8
+
+- Hardened finding normalization so LOW-only advisories keep a CLEAN verdict while MEDIUM, HIGH and CRITICAL evidence continue to escalate appropriately.
+- Added locality requirements for behavioral correlations to prevent unrelated signals in large files from being combined into attack chains.
+- Expanded context filtering for documentation, tests, fixtures, CI, metadata, wordlists, assets and foreign-platform binary strings.
+- Distinguished JavaScript package-manager help/error strings from real runtime execution through child-process, spawn, execa, Bun and Deno APIs.
+- Preserved hard detection for exact malware hashes, confirmed campaign package/dependency names and executable confirmed C2 context.
+- Added AST-scoped self-audit handling for scanner constants, regex definitions and self-test fixtures without creating a blanket package whitelist.
+- Bound insecure HTTP source severity to the checksum state of each concrete source instead of package-wide checksum presence.
+- Kept strongly checksummed HTTP sources without SKIP as visible LOW advisories while weak, missing or skipped verification remains REVIEW-worthy.
+- Separated Pacman metadata-only drift from content tampering while keeping sensitive executable and privileged-path metadata changes REVIEW-worthy.
+- Contextualized expected Chromium/Electron sandbox SUID helpers by package/path structure; matching the sandbox filename alone is not sufficient.
+- Fixed runtime network context to report the actual peer endpoint from ss and deduplicate multiple PID records for the same socket.
+- Added the 1.4.8 false-positive regression suite, a 42-scenario generic behavior/context/provenance corpus and a dedicated runtime-network regression test.
+
 ## 1.4.7
 
 - Added a dedicated desktop launcher that explains why privileged access is required before sudo authentication is requested.
